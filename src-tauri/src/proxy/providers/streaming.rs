@@ -663,6 +663,35 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         // 流自然结束但未收到 [DONE] 时，确保发送缓存的 message_delta 和 message_stop。
         // 若上游已显式报错，则只保留 error 事件，避免把失败伪装成成功完成。
         if !stream_ended_with_error {
+            // 终端事件前先关掉仍打开的 content block（顺序与上面 finish_reason
+            // 路径一致：先文本/思考块，再按 index 升序的工具块）。否则流终止时
+            // 块仍处于未闭合状态，严格解析器同样会丢弃整轮——兜底就白做了。
+            if has_sent_message_start && !has_sent_message_stop {
+                if let Some(index) = current_non_tool_block_index.take() {
+                    let event = json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    });
+                    let sse_data = format!("event: content_block_stop\ndata: {}\n\n",
+                        serde_json::to_string(&event).unwrap_or_default());
+                    yield Ok(Bytes::from(sse_data));
+                }
+                if !open_tool_block_indices.is_empty() {
+                    let mut tool_indices: Vec<u32> =
+                        open_tool_block_indices.iter().copied().collect();
+                    tool_indices.sort_unstable();
+                    for index in tool_indices {
+                        let event = json!({
+                            "type": "content_block_stop",
+                            "index": index
+                        });
+                        let sse_data = format!("event: content_block_stop\ndata: {}\n\n",
+                            serde_json::to_string(&event).unwrap_or_default());
+                        yield Ok(Bytes::from(sse_data));
+                    }
+                    open_tool_block_indices.clear();
+                }
+            }
             if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
                 let event = build_message_delta_event(stop_reason, usage_json);
                 let sse_data = format!("event: message_delta\ndata: {}\n\n",
@@ -1244,6 +1273,24 @@ mod tests {
             Some("max_tokens")
         );
 
+        // EOF 时文本块（index 0）仍打开：必须先发 content_block_stop 再发终端事件，
+        // 否则严格解析器会因块未闭合丢弃整轮。
+        let block_stop_pos = events
+            .iter()
+            .position(|event| {
+                event_type(event) == Some("content_block_stop")
+                    && event.get("index").and_then(|v| v.as_u64()) == Some(0)
+            })
+            .expect("EOF fallback must close the still-open text block");
+        let delta_pos = events
+            .iter()
+            .position(|event| event_type(event) == Some("message_delta"))
+            .expect("terminal message_delta must exist");
+        assert!(
+            block_stop_pos < delta_pos,
+            "content_block_stop must precede the terminal message_delta"
+        );
+
         assert_eq!(
             events
                 .iter()
@@ -1252,6 +1299,59 @@ mod tests {
             1
         );
         assert!(!events.iter().any(|e| event_type(e) == Some("error")));
+    }
+
+    #[tokio::test]
+    async fn test_stream_end_without_finish_reason_closes_open_tool_blocks() {
+        // 同一兜底路径下的工具块：EOF 时已 started 的 tool_use 块也必须收到
+        // content_block_stop（按 index 排序），随后才是 message_delta/message_stop。
+        let input = "data: {\"id\":\"chatcmpl_tool_eof\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_eof\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]}}]}\n\n";
+
+        let events = collect_anthropic_events(input).await;
+
+        let tool_block_index = events
+            .iter()
+            .find_map(|event| {
+                if event_type(event) == Some("content_block_start")
+                    && event
+                        .pointer("/content_block/type")
+                        .and_then(|v| v.as_str())
+                        == Some("tool_use")
+                {
+                    return event.get("index").and_then(|v| v.as_u64());
+                }
+                None
+            })
+            .expect("tool block must have been started before EOF");
+
+        let block_stop_pos = events
+            .iter()
+            .position(|event| {
+                event_type(event) == Some("content_block_stop")
+                    && event.get("index").and_then(|v| v.as_u64()) == Some(tool_block_index)
+            })
+            .expect("EOF fallback must close the still-open tool block");
+        let delta_pos = events
+            .iter()
+            .position(|event| event_type(event) == Some("message_delta"))
+            .expect("terminal message_delta must exist");
+        assert!(
+            block_stop_pos < delta_pos,
+            "content_block_stop must precede the terminal message_delta"
+        );
+
+        assert_eq!(
+            events.last().and_then(|event| event_type(event)),
+            Some("message_stop")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event_type(event) == Some("message_delta"))
+                .and_then(|event| event.pointer("/delta/stop_reason"))
+                .and_then(|v| v.as_str()),
+            Some("max_tokens")
+        );
     }
 
     #[tokio::test]
