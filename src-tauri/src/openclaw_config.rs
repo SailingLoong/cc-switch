@@ -284,6 +284,16 @@ impl OpenClawConfigDocument {
             });
         }
 
+        // Heal every root key on each write, not just the section being
+        // updated: older versions may have emitted several bare keys, and the
+        // promise is that the next save restores strict JSON for the whole
+        // file. Already-quoted keys are rewritten equivalently.
+        for pair in key_value_pairs.iter_mut() {
+            if let Some(name) = json5_key_name(&pair.key).map(str::to_string) {
+                pair.key = make_json5_key(&name);
+            }
+        }
+
         let leading_ws = context
             .as_ref()
             .map(|ctx| ctx.wsc.0.clone())
@@ -296,9 +306,6 @@ impl OpenClawConfigDocument {
             .iter_mut()
             .find(|pair| json5_key_name(&pair.key) == Some(key))
         {
-            // Re-quote the key so sections written bare by older versions are
-            // healed back to strict JSON on the next write.
-            existing.key = make_json5_key(key);
             existing.value = new_value;
             return Ok(());
         }
@@ -1131,6 +1138,38 @@ mod tests {
                 .expect("rewritten openclaw.json must parse as strict JSON");
             assert!(parsed.get("agents").is_some());
             assert!(written.contains("\"models\": {"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn write_heals_all_bare_root_keys_not_just_the_updated_section() {
+        // Older versions could emit more than one bare root key. Healing only
+        // the section being updated would leave the file rejected by strict
+        // JSON consumers after the promised next save (#6467).
+        let source = r#"{
+  models: {
+    "mode": "merge",
+    "providers": {}
+  },
+  agents: {
+    "defaults": {
+      "model": "p1/x"
+    }
+  }
+}
+"#;
+
+        with_test_paths(source, |_| {
+            let outcome = set_provider("p1", json!({ "api": "anthropic-messages" })).unwrap();
+            assert!(outcome.backup_path.is_some());
+
+            let written = fs::read_to_string(get_openclaw_config_path()).unwrap();
+            let parsed = serde_json::from_str::<Value>(&written)
+                .expect("every bare root key must be healed on save, not just `models`");
+            assert!(parsed.get("agents").is_some());
+            assert!(written.contains("\"models\": {"));
+            assert!(written.contains("\"agents\": {"));
         });
     }
 }
