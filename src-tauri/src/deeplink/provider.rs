@@ -490,16 +490,16 @@ fn build_grokbuild_settings(request: &DeepLinkImportRequest) -> serde_json::Valu
         let default_profile = grokbuild_default_profile(catalog, model);
         let mut config_toml = format!(
             "[models]\ndefault = {}\n",
-            toml_edit::Value::from(default_profile).to_string()
+            toml_edit::Value::from(default_profile)
         );
         for profile in &catalog.profiles {
             config_toml.push_str(&format!(
                 "\n[model.{}]\nmodel = {}\nbase_url = {}\nname = {}\napi_key = {}\napi_backend = \"{}\"\ncontext_window = {}\n",
-                toml_edit::Value::from(profile.profile.as_str()).to_string(),
-                toml_edit::Value::from(profile.model.as_str()).to_string(),
-                toml_edit::Value::from(endpoint.as_str()).to_string(),
-                toml_edit::Value::from(profile.name.as_str()).to_string(),
-                toml_edit::Value::from(api_key).to_string(),
+                toml_edit::Value::from(profile.profile.as_str()),
+                toml_edit::Value::from(profile.model.as_str()),
+                toml_edit::Value::from(endpoint.as_str()),
+                toml_edit::Value::from(profile.name.as_str()),
+                toml_edit::Value::from(api_key),
                 crate::grok_config::DEFAULT_API_BACKEND,
                 profile.context_window,
             ));
@@ -511,7 +511,7 @@ fn build_grokbuild_settings(request: &DeepLinkImportRequest) -> serde_json::Valu
             {
                 config_toml.push_str(&format!(
                     "description = {}\n",
-                    toml_edit::Value::from(description).to_string()
+                    toml_edit::Value::from(description)
                 ));
             }
         }
