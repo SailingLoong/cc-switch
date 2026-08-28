@@ -859,11 +859,14 @@ impl ProxyService {
 
         let rollback_result = match previous_backup {
             Some(backup) => {
+                // 保留备份原记录的归属（而非回滚目标的 current）：残留备份的
+                // 内容属于其原 owner，重打 previous_provider_id 会把「内容与
+                // 归属不符」洗白，让后续恢复重新接受外供应商凭据。
                 self.db
                     .save_live_backup(
                         app_type.as_str(),
                         &backup.original_config,
-                        previous_provider_id,
+                        backup.provider_id.as_deref(),
                     )
                     .await
             }
@@ -4306,6 +4309,53 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("sk-provider-a"),
             "归属未变的备份应照常还原（不能因归属校验而过度拦截）"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hot_switch_rollback_preserves_backup_owner_stamp() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+
+        // 残留态：备份内容属于 a，但热切换前的 current 是 b；切换失败回滚时
+        // 备份槽重存的内容必须保留其原归属 a，而不是被洗白成 b。
+        let stale_backup = crate::proxy::types::LiveBackup {
+            app_type: "claude".to_string(),
+            original_config: serde_json::to_string(&json!({
+                "env": { "ANTHROPIC_AUTH_TOKEN": "sk-provider-a" }
+            }))
+            .expect("serialize stale backup"),
+            backed_up_at: "2026-08-28T00:00:00Z".to_string(),
+            provider_id: Some("a".to_string()),
+        };
+
+        service
+            .rollback_hot_switch_preparation(
+                &AppType::Claude,
+                Some(&stale_backup),
+                Some("b"),
+                true,
+                false,
+                None,
+            )
+            .await;
+
+        let restored = db
+            .get_live_backup("claude")
+            .await
+            .expect("read live backup")
+            .expect("backup exists");
+        assert_eq!(
+            restored.provider_id.as_deref(),
+            Some("a"),
+            "回滚重存的备份必须保留原归属，不能改打成回滚目标的 current"
+        );
+        assert!(
+            restored.original_config.contains("sk-provider-a"),
+            "备份内容应原样保留"
         );
     }
 
